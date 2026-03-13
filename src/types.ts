@@ -71,6 +71,16 @@ export interface ObsidianGitSettings {
         showSigns: boolean;
         statusBar: "disabled" | "colored" | "monochrome";
     };
+    /**
+     * Enable transparent encryption for git operations.
+     * Files remain plaintext on disk but are encrypted in the git repository.
+     */
+    encryptionEnabled: boolean;
+    /**
+     * Newline-separated glob patterns for files to encrypt.
+     * Example: "daily/**\n*.secret.md\n!README.md"
+     */
+    encryptionPatterns: string;
 }
 
 /**

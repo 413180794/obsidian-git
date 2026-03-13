@@ -6,6 +6,14 @@
 import type { DataAdapter, Vault } from "obsidian";
 import { normalizePath, TFile } from "obsidian";
 import type ObsidianGit from "../main";
+import {
+    encrypt,
+    encryptString,
+    decrypt,
+    decryptToString,
+    isEncrypted,
+} from "../encryption/crypto";
+import { shouldEncrypt } from "../encryption/fileFilter";
 
 export class MyAdapter {
     promises: any = {};
@@ -15,6 +23,12 @@ export class MyAdapter {
     indexctime: number | undefined;
     indexmtime: number | undefined;
     lastBasePath: string | undefined;
+
+    /**
+     * When true, readFile will encrypt matching files before returning to isomorphic-git.
+     * Set by IsomorphicGit before git.add() / statusMatrix() and cleared after.
+     */
+    isGitOperation = false;
 
     constructor(
         vault: Vault,
@@ -35,17 +49,60 @@ export class MyAdapter {
         this.promises.readlink = this.readlink.bind(this);
         this.promises.symlink = this.symlink.bind(this);
     }
+
+    /**
+     * Whether encryption is active: enabled in settings and password is set.
+     */
+    private get encryptionActive(): boolean {
+        return (
+            this.plugin.settings.encryptionEnabled &&
+            !!this.plugin.localStorage.getEncryptionPassword() &&
+            !!this.plugin.settings.encryptionPatterns.trim()
+        );
+    }
+
+    /**
+     * Get the encryption password from localStorage.
+     */
+    private get encryptionPassword(): string {
+        return this.plugin.localStorage.getEncryptionPassword() ?? "";
+    }
+
+    /**
+     * Check if a file path should be encrypted based on settings.
+     */
+    private shouldEncryptPath(path: string): boolean {
+        return shouldEncrypt(path, this.plugin.settings.encryptionPatterns);
+    }
+
     async readFile(path: string, opts: any) {
         this.maybeLog("Read: " + path + JSON.stringify(opts));
         if (opts == "utf8" || opts.encoding == "utf8") {
             const file = this.vault.getAbstractFileByPath(path);
+            let content: string;
             if (file instanceof TFile) {
                 this.maybeLog("Reuse");
-
-                return this.vault.read(file);
+                content = await this.vault.read(file);
             } else {
-                return this.adapter.read(path);
+                content = await this.adapter.read(path);
             }
+
+            // Clean filter: encrypt for git operations
+            if (
+                this.isGitOperation &&
+                this.encryptionActive &&
+                this.shouldEncryptPath(path)
+            ) {
+                this.maybeLog("Encrypting (utf8): " + path);
+                const encrypted = await encryptString(
+                    content,
+                    this.encryptionPassword
+                );
+                // Return as Uint8Array since encrypted data is binary
+                return new Uint8Array(encrypted);
+            }
+
+            return content;
         } else {
             if (path.endsWith(this.gitDir + "/index")) {
                 if (this.plugin.settings.basePath != this.lastBasePath) {
@@ -56,17 +113,56 @@ export class MyAdapter {
                 return this.index ?? this.adapter.readBinary(path);
             }
             const file = this.vault.getAbstractFileByPath(path);
+            let content: ArrayBuffer;
             if (file instanceof TFile) {
                 this.maybeLog("Reuse");
-
-                return this.vault.readBinary(file);
+                content = await this.vault.readBinary(file);
             } else {
-                return this.adapter.readBinary(path);
+                content = await this.adapter.readBinary(path);
             }
+
+            // Clean filter: encrypt for git operations
+            if (
+                this.isGitOperation &&
+                this.encryptionActive &&
+                this.shouldEncryptPath(path)
+            ) {
+                this.maybeLog("Encrypting (binary): " + path);
+                return encrypt(content, this.encryptionPassword);
+            }
+
+            return content;
         }
     }
+
     async writeFile(path: string, data: string | ArrayBuffer) {
         this.maybeLog("Write: " + path);
+
+        // Smudge filter: decrypt incoming data from git
+        if (this.encryptionActive && typeof data !== "string") {
+            if (isEncrypted(data)) {
+                this.maybeLog("Decrypting: " + path);
+                try {
+                    const decrypted = await decryptToString(
+                        data,
+                        this.encryptionPassword
+                    );
+                    // Write as string (plaintext) instead of binary
+                    const file = this.vault.getAbstractFileByPath(path);
+                    if (file instanceof TFile) {
+                        return this.vault.modify(file, decrypted);
+                    } else {
+                        return this.adapter.write(path, decrypted);
+                    }
+                } catch (e) {
+                    // Decryption failed (wrong password?) — write encrypted data as-is
+                    console.warn(
+                        `obsidian-git: Failed to decrypt ${path}:`,
+                        e
+                    );
+                }
+            }
+        }
 
         if (typeof data === "string") {
             const file = this.vault.getAbstractFileByPath(path);

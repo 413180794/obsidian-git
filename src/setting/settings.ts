@@ -907,6 +907,62 @@ export class ObsidianGitSettingsTab extends PluginSettingTab {
                     });
                 });
 
+        // ── Encryption Settings ──
+        new Setting(containerEl).setName("Encryption").setHeading();
+
+        new Setting(containerEl)
+            .setName("Enable encryption")
+            .setDesc(
+                "Encrypt files in git. Files remain plaintext on disk but are encrypted in the repository. Only works with the mobile (IsomorphicGit) backend."
+            )
+            .addToggle((toggle) =>
+                toggle
+                    .setValue(plugin.settings.encryptionEnabled)
+                    .onChange(async (value) => {
+                        plugin.settings.encryptionEnabled = value;
+                        await plugin.saveSettings();
+                        this.display();
+                    })
+            );
+
+        if (plugin.settings.encryptionEnabled) {
+            new Setting(containerEl)
+                .setName("Encryption password")
+                .setDesc(
+                    "Set your encryption password. Stored locally only — you won't see it again after closing settings."
+                )
+                .addText((cb) => {
+                    cb.inputEl.type = "password";
+                    cb.inputEl.autocapitalize = "off";
+                    cb.inputEl.autocomplete = "off";
+                    cb.inputEl.spellcheck = false;
+                    cb.setPlaceholder(
+                        plugin.localStorage.getEncryptionPassword()
+                            ? "••••••••"
+                            : "Enter password"
+                    );
+                    cb.onChange((value) => {
+                        plugin.localStorage.setEncryptionPassword(value);
+                    });
+                });
+
+            new Setting(containerEl)
+                .setName("File patterns to encrypt")
+                .setDesc(
+                    "Glob patterns, one per line. Example: daily/**, *.secret.md. Lines starting with ! are exclusions."
+                )
+                .addTextArea((cb) => {
+                    cb.setPlaceholder("daily/**\n*.secret.md\n!README.md");
+                    cb.setValue(plugin.settings.encryptionPatterns);
+                    cb.inputEl.rows = 5;
+                    cb.inputEl.cols = 30;
+                    cb.onChange(async (value) => {
+                        plugin.settings.encryptionPatterns = value;
+                        await plugin.saveSettings();
+                    });
+                });
+        }
+
         new Setting(containerEl)
             .setName("Custom base path (Git repository path)")
             .setDesc(

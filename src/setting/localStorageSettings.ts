@@ -18,6 +18,7 @@ export class LocalStorageSettings {
             "lastAutoPush",
             "gitPath",
             "pluginDisabled",
+            "encryptionPassword",
         ];
         for (const key of keys) {
             const old = localStorage.getItem(this.prefix + key);
@@ -121,6 +122,17 @@ export class LocalStorageSettings {
         return this.app.saveLocalStorage(
             this.prefix + "envVars",
             JSON.stringify(value)
+        );
+    }
+
+    getEncryptionPassword(): string | null {
+        return this.app.loadLocalStorage(this.prefix + "encryptionPassword");
+    }
+
+    setEncryptionPassword(value: string): void {
+        return this.app.saveLocalStorage(
+            this.prefix + "encryptionPassword",
+            value
         );
     }
 

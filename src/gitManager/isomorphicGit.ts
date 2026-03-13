@@ -164,9 +164,11 @@ export class IsomorphicGit extends GitManager {
             if (opts?.path != undefined) {
                 statusOpts.filepaths = [`${opts.path}/`];
             }
+            this.fs.isGitOperation = true;
             const status = (
                 await this.wrapFS(git.statusMatrix(statusOpts))
             ).map((row) => this.getFileStatusResult(row));
+            this.fs.isGitOperation = false;
 
             const changed: FileStatusResult[] = [];
             const staged: FileStatusResult[] = [];
@@ -258,15 +260,18 @@ export class IsomorphicGit extends GitManager {
         try {
             this.plugin.setPluginState({ gitAction: CurrentGitAction.add });
             if (await this.app.vault.adapter.exists(vaultPath)) {
+                this.fs.isGitOperation = true;
                 await this.wrapFS(
                     git.add({ ...this.getRepo(), filepath: gitPath })
                 );
+                this.fs.isGitOperation = false;
             } else {
                 await this.wrapFS(
                     git.remove({ ...this.getRepo(), filepath: gitPath })
                 );
             }
         } catch (error) {
+            this.fs.isGitOperation = false;
             this.plugin.displayError(error);
             throw error;
         }
@@ -282,6 +287,7 @@ export class IsomorphicGit extends GitManager {
         unstagedFiles?: UnstagedFile[];
     }): Promise<void> {
         try {
+            this.fs.isGitOperation = true;
             if (status) {
                 await Promise.all(
                     status.changed.map((file) =>
@@ -311,7 +317,9 @@ export class IsomorphicGit extends GitManager {
                     )
                 );
             }
+            this.fs.isGitOperation = false;
         } catch (error) {
+            this.fs.isGitOperation = false;
             this.plugin.displayError(error);
             throw error;
         }
