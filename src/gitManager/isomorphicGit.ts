@@ -164,11 +164,9 @@ export class IsomorphicGit extends GitManager {
             if (opts?.path != undefined) {
                 statusOpts.filepaths = [`${opts.path}/`];
             }
-            this.fs.isGitOperation = true;
             const status = (
                 await this.wrapFS(git.statusMatrix(statusOpts))
             ).map((row) => this.getFileStatusResult(row));
-            this.fs.isGitOperation = false;
 
             const changed: FileStatusResult[] = [];
             const staged: FileStatusResult[] = [];
@@ -260,18 +258,23 @@ export class IsomorphicGit extends GitManager {
         try {
             this.plugin.setPluginState({ gitAction: CurrentGitAction.add });
             if (await this.app.vault.adapter.exists(vaultPath)) {
-                this.fs.isGitOperation = true;
-                await this.wrapFS(
-                    git.add({ ...this.getRepo(), filepath: gitPath })
-                );
-                this.fs.isGitOperation = false;
+                // Encrypt matching files on disk before staging
+                const encrypted = await this.fs.encryptFilesOnDisk([vaultPath]);
+                try {
+                    await this.wrapFS(
+                        git.add({ ...this.getRepo(), filepath: gitPath })
+                    );
+                } catch (error) {
+                    // Restore plaintext if staging failed
+                    await this.fs.restoreFiles(encrypted);
+                    throw error;
+                }
             } else {
                 await this.wrapFS(
                     git.remove({ ...this.getRepo(), filepath: gitPath })
                 );
             }
         } catch (error) {
-            this.fs.isGitOperation = false;
             this.plugin.displayError(error);
             throw error;
         }
@@ -287,39 +290,66 @@ export class IsomorphicGit extends GitManager {
         unstagedFiles?: UnstagedFile[];
     }): Promise<void> {
         try {
-            this.fs.isGitOperation = true;
+            // Collect file paths that will be staged (non-deleted)
+            let filePaths: string[] = [];
             if (status) {
-                await Promise.all(
-                    status.changed.map((file) =>
-                        file.workingDir !== "D"
-                            ? this.wrapFS(
-                                  git.add({
+                filePaths = status.changed
+                    .filter((f) => f.workingDir !== "D")
+                    .map((f) => f.path);
+            } else {
+                const files =
+                    unstagedFiles ?? (await this.getUnstagedFiles(dir ?? "."));
+                filePaths = files
+                    .filter(({ type }) => type !== "D")
+                    .map(({ path }) => path);
+            }
+
+            // Encrypt matching files on disk before staging
+            const encrypted = await this.fs.encryptFilesOnDisk(filePaths);
+
+            try {
+                if (status) {
+                    await Promise.all(
+                        status.changed.map((file) =>
+                            file.workingDir !== "D"
+                                ? this.wrapFS(
+                                      git.add({
+                                          ...this.getRepo(),
+                                          filepath: file.path,
+                                      })
+                                  )
+                                : git.remove({
                                       ...this.getRepo(),
                                       filepath: file.path,
                                   })
-                              )
-                            : git.remove({
-                                  ...this.getRepo(),
-                                  filepath: file.path,
-                              })
-                    )
-                );
-            } else {
-                const filesToStage =
-                    unstagedFiles ?? (await this.getUnstagedFiles(dir ?? "."));
-                await Promise.all(
-                    filesToStage.map(({ path, type }) =>
-                        type == "D"
-                            ? git.remove({ ...this.getRepo(), filepath: path })
-                            : this.wrapFS(
-                                  git.add({ ...this.getRepo(), filepath: path })
-                              )
-                    )
-                );
+                        )
+                    );
+                } else {
+                    const filesToStage =
+                        unstagedFiles ??
+                        (await this.getUnstagedFiles(dir ?? "."));
+                    await Promise.all(
+                        filesToStage.map(({ path, type }) =>
+                            type == "D"
+                                ? git.remove({
+                                      ...this.getRepo(),
+                                      filepath: path,
+                                  })
+                                : this.wrapFS(
+                                      git.add({
+                                          ...this.getRepo(),
+                                          filepath: path,
+                                      })
+                                  )
+                        )
+                    );
+                }
+            } catch (error) {
+                // Restore plaintext if staging failed
+                await this.fs.restoreFiles(encrypted);
+                throw error;
             }
-            this.fs.isGitOperation = false;
         } catch (error) {
-            this.fs.isGitOperation = false;
             this.plugin.displayError(error);
             throw error;
         }

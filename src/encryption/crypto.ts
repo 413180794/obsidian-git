@@ -1,51 +1,43 @@
 /**
- * Core encryption/decryption module for obsidian-git.
+ * Meld Encrypt compatible encryption module.
  *
- * Scheme: AES-256-GCM with PBKDF2 key derivation.
- * File format:
- *   - 10 bytes: magic header "OBSGITENC\x00"
- *   - 1 byte:   version (0x01)
- *   - 16 bytes: PBKDF2 salt
- *   - 12 bytes: AES-GCM IV/nonce
- *   - rest:     ciphertext (includes 16-byte GCM auth tag)
+ * Uses the exact same crypto as Meld Encrypt plugin v2 (CryptoHelper2304_v2):
+ *   - AES-256-GCM
+ *   - PBKDF2 with SHA-512, 210,000 iterations
+ *   - 16-byte random IV + 16-byte random salt
+ *   - Encrypted bytes: [IV(16)][Salt(16)][Ciphertext+GCM_Tag]
+ *   - Stored as base64 wrapped in Meld Encrypt markers
  *
- * Uses Web Crypto API (available in Electron + mobile WebView).
+ * Marker format: %%🔐β <base64_ciphertext> 🔐%%
+ *
+ * Files encrypted this way can be decrypted by Meld Encrypt plugin directly.
  */
 
-const MAGIC_HEADER = new Uint8Array([
-    0x4f, 0x42, 0x53, 0x47, 0x49, 0x54, 0x45, 0x4e, 0x43, 0x00,
-]); // "OBSGITENC\0"
-const VERSION = 0x01;
-const HEADER_LEN = 10; // magic
-const VERSION_LEN = 1;
-const SALT_LEN = 16;
-const IV_LEN = 12;
-const META_LEN = HEADER_LEN + VERSION_LEN + SALT_LEN + IV_LEN; // 39 bytes
-const PBKDF2_ITERATIONS = 100_000;
+const VECTOR_SIZE = 16; // IV size
+const SALT_SIZE = 16;
+const ITERATIONS = 210_000;
+
+// Meld Encrypt v2 markers
+const MELD_PREFIX = "%%\u{1F510}\u03B2 "; // %%🔐β
+const MELD_SUFFIX = " \u{1F510}%%"; // 🔐%%
+const MELD_HINT_MARKER = "\u{1F4A1}"; // 💡
 
 /**
- * Check if data starts with the encryption magic header.
+ * Check if text content is encrypted with Meld Encrypt markers.
  */
-export function isEncrypted(data: ArrayBuffer | Uint8Array): boolean {
-    const view = new Uint8Array(
-        data instanceof ArrayBuffer ? data : data.buffer,
-        data instanceof ArrayBuffer ? 0 : data.byteOffset,
-        Math.min(data.byteLength, HEADER_LEN + VERSION_LEN)
+export function isMeldEncrypted(text: string): boolean {
+    const trimmed = text.trim();
+    return (
+        (trimmed.startsWith("%%\u{1F510}") ||
+            trimmed.startsWith("\u{1F510}")) &&
+        (trimmed.endsWith("\u{1F510}%%") || trimmed.endsWith("\u{1F510}"))
     );
-    if (view.byteLength < HEADER_LEN + VERSION_LEN) return false;
-    for (let i = 0; i < HEADER_LEN; i++) {
-        if (view[i] !== MAGIC_HEADER[i]) return false;
-    }
-    return view[HEADER_LEN] === VERSION;
 }
 
 /**
- * Check if a string might be encrypted (starts with the magic bytes).
+ * Derive an AES-256-GCM key from password + salt using PBKDF2 (SHA-512).
+ * Matches Meld Encrypt CryptoHelper2304_v2.
  */
-export function isEncryptedString(data: string): boolean {
-    return data.startsWith("OBSGITENC\x00");
-}
-
 async function deriveKey(
     password: string,
     salt: Uint8Array
@@ -61,9 +53,9 @@ async function deriveKey(
     return crypto.subtle.deriveKey(
         {
             name: "PBKDF2",
+            hash: "SHA-512",
             salt,
-            iterations: PBKDF2_ITERATIONS,
-            hash: "SHA-256",
+            iterations: ITERATIONS,
         },
         keyMaterial,
         { name: "AES-GCM", length: 256 },
@@ -73,90 +65,131 @@ async function deriveKey(
 }
 
 /**
- * Encrypt plaintext bytes. Returns ArrayBuffer with header + salt + IV + ciphertext.
+ * Encrypt plaintext string to Meld Encrypt v2 format bytes.
+ * Returns: [16-byte IV][16-byte Salt][Ciphertext+GCM_Tag]
  */
-export async function encrypt(
-    plaintext: ArrayBuffer,
-    password: string
-): Promise<ArrayBuffer> {
-    const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN));
-    const iv = crypto.getRandomValues(new Uint8Array(IV_LEN));
-    const key = await deriveKey(password, salt);
-
-    const ciphertext = await crypto.subtle.encrypt(
-        { name: "AES-GCM", iv },
-        key,
-        plaintext
-    );
-
-    // Assemble: header + version + salt + iv + ciphertext
-    const result = new Uint8Array(META_LEN + ciphertext.byteLength);
-    result.set(MAGIC_HEADER, 0);
-    result[HEADER_LEN] = VERSION;
-    result.set(salt, HEADER_LEN + VERSION_LEN);
-    result.set(iv, HEADER_LEN + VERSION_LEN + SALT_LEN);
-    result.set(new Uint8Array(ciphertext), META_LEN);
-
-    return result.buffer;
-}
-
-/**
- * Decrypt an encrypted ArrayBuffer. Returns plaintext ArrayBuffer.
- * Throws on wrong password or corrupted data.
- */
-export async function decrypt(
-    encrypted: ArrayBuffer,
-    password: string
-): Promise<ArrayBuffer> {
-    const data = new Uint8Array(encrypted);
-    if (data.byteLength < META_LEN + 16) {
-        // minimum: header + at least GCM tag
-        throw new Error("Encrypted data too short");
-    }
-
-    // Verify header
-    if (!isEncrypted(data)) {
-        throw new Error("Not an encrypted file (invalid header)");
-    }
-
-    const salt = data.slice(
-        HEADER_LEN + VERSION_LEN,
-        HEADER_LEN + VERSION_LEN + SALT_LEN
-    );
-    const iv = data.slice(
-        HEADER_LEN + VERSION_LEN + SALT_LEN,
-        META_LEN
-    );
-    const ciphertext = data.slice(META_LEN);
-
-    const key = await deriveKey(password, salt);
-
-    return crypto.subtle.decrypt(
-        { name: "AES-GCM", iv },
-        key,
-        ciphertext
-    );
-}
-
-/**
- * Encrypt a UTF-8 string. Returns encrypted ArrayBuffer.
- */
-export async function encryptString(
+async function encryptToBytes(
     plaintext: string,
     password: string
-): Promise<ArrayBuffer> {
-    const enc = new TextEncoder();
-    return encrypt(enc.encode(plaintext).buffer, password);
+): Promise<Uint8Array> {
+    const salt = crypto.getRandomValues(new Uint8Array(SALT_SIZE));
+    const iv = crypto.getRandomValues(new Uint8Array(VECTOR_SIZE));
+    const key = await deriveKey(password, salt);
+    const encoded = new TextEncoder().encode(plaintext);
+    const ciphertext = new Uint8Array(
+        await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded)
+    );
+
+    // Assemble: [IV][Salt][Ciphertext] — matches Meld Encrypt v2 layout
+    const result = new Uint8Array(
+        iv.byteLength + salt.byteLength + ciphertext.byteLength
+    );
+    result.set(iv, 0);
+    result.set(salt, iv.byteLength);
+    result.set(ciphertext, iv.byteLength + salt.byteLength);
+    return result;
 }
 
 /**
- * Decrypt to a UTF-8 string. Throws on failure.
+ * Convert Uint8Array to string (for btoa).
  */
-export async function decryptToString(
-    encrypted: ArrayBuffer,
+function bytesToString(bytes: Uint8Array): string {
+    let str = "";
+    for (let i = 0; i < bytes.length; i++) {
+        str += String.fromCharCode(bytes[i]);
+    }
+    return str;
+}
+
+/**
+ * Convert string to Uint8Array (from atob).
+ */
+function stringToBytes(str: string): Uint8Array {
+    const bytes = new Uint8Array(str.length);
+    for (let i = 0; i < str.length; i++) {
+        bytes[i] = str.charCodeAt(i);
+    }
+    return bytes;
+}
+
+/**
+ * Encrypt plaintext to a Meld Encrypt compatible string.
+ * Output format: %%🔐β <base64_encrypted_data> 🔐%%
+ */
+export async function encryptForMeld(
+    plaintext: string,
     password: string
 ): Promise<string> {
-    const plainBuffer = await decrypt(encrypted, password);
-    const dec = new TextDecoder();
-    return dec.decode(plainBuffer);
+    const encrypted = await encryptToBytes(plaintext, password);
+    const base64 = btoa(bytesToString(encrypted));
+    return MELD_PREFIX + base64 + MELD_SUFFIX;
+}
+
+/**
+ * Decrypt a Meld Encrypt formatted string.
+ * Returns null if decryption fails (wrong password).
+ */
+export async function decryptFromMeld(
+    encryptedText: string,
+    password: string
+): Promise<string | null> {
+    try {
+        const trimmed = encryptedText.trim();
+
+        // Find and strip prefix
+        let content = trimmed;
+        const prefixes = [
+            "%%\u{1F510}\u03B2 ",
+            "\u{1F510}\u03B2 ",
+            "%%\u{1F510}\u03B1 ",
+            "\u{1F510}\u03B1 ",
+            "%%\u{1F510} ",
+            "\u{1F510} ",
+        ];
+        const suffixes = [" \u{1F510}%%", " \u{1F510}"];
+
+        let foundPrefix = "";
+        for (const p of prefixes) {
+            if (content.startsWith(p)) {
+                foundPrefix = p;
+                content = content.substring(p.length);
+                break;
+            }
+        }
+        if (!foundPrefix) return null;
+
+        for (const s of suffixes) {
+            if (content.endsWith(s)) {
+                content = content.substring(0, content.length - s.length);
+                break;
+            }
+        }
+
+        // Strip hint if present: 💡hint💡
+        if (content.startsWith(MELD_HINT_MARKER)) {
+            const hintEnd = content.indexOf(MELD_HINT_MARKER, 1);
+            if (hintEnd > 0) {
+                content = content.substring(hintEnd + MELD_HINT_MARKER.length);
+            }
+        }
+
+        // Decode base64 to bytes
+        const bytes = stringToBytes(atob(content));
+
+        // Parse: [IV(16)][Salt(16)][Ciphertext]
+        const iv = bytes.slice(0, VECTOR_SIZE);
+        const salt = bytes.slice(VECTOR_SIZE, VECTOR_SIZE + SALT_SIZE);
+        const ciphertext = bytes.slice(VECTOR_SIZE + SALT_SIZE);
+
+        const key = await deriveKey(password, salt);
+        const decrypted = await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv },
+            key,
+            ciphertext
+        );
+
+        return new TextDecoder().decode(decrypted);
+    } catch {
+        return null;
+    }
 }
